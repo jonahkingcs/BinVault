@@ -1,0 +1,11 @@
+appId: com.binwise.desktop
+productName: Binwise
+electronDist: node_modules/electron/dist
+directories:
+  output: release
+files:
+  - out/**/*
+  - package.json
+win:
+  target: dir
+  signAndEditExecutable: false
