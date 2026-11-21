@@ -73,6 +73,39 @@ test('indexes real files, exposes the folder tree and searches the entire librar
   assert.equal(library.getAssets({ ...all, search: 'unknown" OR *' }).total, 0)
 })
 
+test('shares global matching and filters with recursive folder search', async t => {
+  const temp = await mkdtempDisposable(join(tmpdir(), 'binwise-folder-search-'))
+  const library = new Library(':memory:')
+  t.after(async () => { library.close(); await temp.remove() })
+  const root = join(temp.path, 'Assets')
+  await Promise.all([
+    write(join(root, 'PS4', 'Menu.wav')),
+    write(join(root, 'PS4', 'Deep', 'Creative', 'Sweden.wav')),
+    write(join(root, 'PS4_Backups', 'Menu Backup.wav')),
+    write(join(temp.path, 'Other Root', 'Menu Outside.wav')),
+  ])
+  await library.importFolder(root)
+  await library.importFolder(join(temp.path, 'Other Root'))
+  const rootFolder = library.getLibrary().roots.find(item => item.name === 'Assets')!.folder.id
+  const folders = library.getFolders(rootFolder)
+  const folderId = folders.find(folder => folder.name === 'PS4')!.id
+  const scope = { type: 'folder', folderId } as const
+  const scoped = { ...all, scope, searchWithinFolder: true, sort: 'relevance' } as const
+  const names = (query: AssetQuery) => library.getAssets(query).assets.map(asset => asset.name)
+  assert.deepEqual(names({ ...all, scope, search: 'menu' }), ['Menu Backup.wav', 'Menu Outside.wav', 'Menu.wav'])
+  assert.deepEqual(names({ ...scoped, search: 'menu' }), ['Menu.wav'])
+  assert.deepEqual(names({ ...scoped, search: 'creative swed' }), ['Sweden.wav'])
+  const sweden = library.getAssets({ ...scoped, search: 'sweden' }).assets[0]!
+  library.updateAsset(sweden.id, { addTag: 'ambient', category: 'Music' })
+  assert.deepEqual(names({ ...scoped, search: 'ambient music', category: 'Music', fileType: 'audio' }), ['Sweden.wav'])
+  assert.deepEqual(names({ ...all, search: 'ambient music', category: 'Music', fileType: 'audio' }), ['Sweden.wav'])
+  assert.equal(library.getAssets({ ...scoped, search: 'ambient', fileType: 'video' }).total, 0)
+  assert.equal(library.getAssets({ ...scoped, search: 'ambient', category: 'Images' }).total, 0)
+  const sibling = { type: 'folder', folderId: folders.find(folder => folder.name === 'PS4_Backups')!.id } as const
+  assert.deepEqual(names({ ...scoped, scope: sibling, search: 'menu' }), ['Menu Backup.wav'])
+  assert.deepEqual(names({ ...all, scope }), ['Menu.wav', 'Sweden.wav'])
+})
+
 test('applies each quick file type, additive filters and the new sorts before pagination', async t => {
   const temp = await mkdtempDisposable(join(tmpdir(), 'binwise-filters-'))
   t.after(() => temp.remove())
@@ -125,7 +158,13 @@ test('migrates a version-one library in place and preserves notes by asset acros
   library.close()
   library = undefined
   const legacy = new DatabaseSync(database)
-  legacy.exec('ALTER TABLE assets DROP COLUMN notes; PRAGMA user_version = 1;')
+  legacy.exec(`
+    DROP INDEX missing_identity;
+    ALTER TABLE assets DROP COLUMN confirmed_missing;
+    ALTER TABLE assets DROP COLUMN file_identity;
+    ALTER TABLE assets DROP COLUMN notes;
+    PRAGMA user_version = 1;
+  `)
   legacy.close()
 
   library = new Library(database)
@@ -185,23 +224,25 @@ test('retains tags, category, favourites and identity across overlaps, rescans a
 
   await rename(original, moved)
   await library.rescan(first.rootId)
-  assert.equal(library.getAsset(asset.id).available, false)
   await library.rescan(second.rootId)
-  assert.equal(library.getAsset(asset.id).available, false)
-  assert.deepEqual(library.getAsset(asset.id).tags, ['Cutaway'])
+  assert.equal(library.getAssets(all).total, 1)
   const renamed = library.getAssets({ ...all, search: 'renamed' }).assets[0]!
-  assert.notEqual(renamed.id, asset.id)
+  assert.equal(renamed.id, asset.id)
+  assert.deepEqual(renamed.tags, ['Cutaway'])
+  assert.equal(renamed.favourite, true)
+  assert.equal(renamed.category, 'Graphics')
+  assert.equal(renamed.addedAt, asset.addedAt)
   assert.equal(renamed.available, true)
   await rename(moved, original)
   await library.rescan(first.rootId)
-  assert.equal(library.getAsset(asset.id).available, true)
+  assert.equal(library.getAsset(asset.id).absolutePath, original)
   await rename(original, moved)
   await library.rescan(second.rootId)
-  assert.equal(library.getAsset(asset.id).available, false)
+  assert.equal(library.getAsset(asset.id).absolutePath, moved)
   await rename(moved, original)
   await library.rescan(second.rootId)
-  assert.equal(library.getAsset(asset.id).available, true)
-  assert.equal(library.getAsset(renamed.id).available, false)
+  assert.equal(library.getAsset(asset.id).absolutePath, original)
+  assert.equal(library.getAssets({ ...all, search: 'renamed' }).total, 0)
   library.updateAsset(asset.id, { removeTag: 'cutaway', favourite: false })
   assert.equal(library.getAssets({ ...all, search: 'cutaway' }).total, 0)
   assert.equal(library.getLibrary().counts.favourites, 0)

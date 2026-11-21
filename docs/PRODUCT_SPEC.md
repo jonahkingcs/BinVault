@@ -18,6 +18,7 @@ Search must span every linked folder and match filenames, folder names and paths
 ## Library and metadata
 
 - Linking an existing folder, such as `D:\Video Editing Assets`, recursively discovers supported assets and keeps the original folder hierarchy browsable. Files stay in their existing locations. Linking is the default workflow.
+- Linked folders and their subfolders update automatically while Binwise is open. A sync indicator shows progress or limited coverage, and Refresh Library reconciles all linked folders on demand.
 - Each asset has an ID, filename, absolute path, linked root, relative folder path, extension, category, file size, date added, last modified date, favourite flag, optional notes, and zero or more reusable custom tags.
 - Store data in SQLite using normalised tables for assets and reusable tags. Use FTS5 with substring matching where needed. Preserve user metadata across rescans and restarts and avoid duplicate records on rescans.
 - Handle renamed, moved, missing, and inaccessible files gracefully. Any future operation that deletes, moves, renames, or overwrites original files requires explicit confirmation.
@@ -26,7 +27,8 @@ Search must span every linked folder and match filenames, folder names and paths
 ## Desktop experience
 
 - Use a compact navy-grey theme, clear typography, subtle borders, and blue focus and selection states.
-- The sidebar begins with a large universal Quick Search above All Assets, Favourites, Recently Added, collapsible categories, the independently scrolling linked folder tree, and Settings. Ctrl+K focuses search. Clearing search restores the current browsing scope.
+- The sidebar begins with a large universal Quick Search above All Assets, Favourites, Recently Added, collapsible categories, the independently scrolling linked folder tree, and Settings. Ctrl+K focuses Quick Search.
+- A separate search field in the central browser searches the selected linked folder and its descendants. A non-empty Quick Search takes priority, and clearing it resumes any folder query. Toolbar filters apply in both search modes and during ordinary browsing. Both search modes update as the linked index changes.
 - The central toolbar provides file-type shortcuts, additional filters, sorting, Import Folder, and layout controls. The default layout stacks a thumbnail grid above a detailed file table with independent scrolling and a resizable divider. Both views share the same results and selection. Either view can fill the browser.
 - The inspector displays the selected file, its preview, known media dimensions and duration, original location, editable category, tags and notes, and persistent access to Explorer and path actions.
 - The sidebar and inspector are resizable. The app remembers the preferred widths, split ratio, layout, and sort order.
@@ -59,7 +61,6 @@ Implement incrementally, inspect files before changing them, test indexing and s
 
 ## Roadmap beyond v0.1
 
-- Real-time folder watching and automatic updates
 - Bulk tagging and category changes
 - Automatic tags from folder and file names
 - Duplicate detection

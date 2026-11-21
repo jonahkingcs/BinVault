@@ -1,17 +1,18 @@
 const assert = require('node:assert/strict')
 const { spawnSync } = require('node:child_process')
-const { mkdirSync, mkdtempDisposableSync, readFileSync, writeFileSync } = require('node:fs')
+const { mkdirSync, mkdtempDisposableSync, readFileSync, renameSync, rmdirSync, unlinkSync, writeFileSync } = require('node:fs')
 const { tmpdir } = require('node:os')
 const { join, resolve } = require('node:path')
 const { setTimeout: delay } = require('node:timers/promises')
 
+const searchOnly = process.argv.includes('--search-only')
 if (!process.versions.electron) {
   const temp = mkdtempDisposableSync(join(tmpdir(), 'binwise-desktop-'))
   const desktopEnv = { ...process.env }
   delete desktopEnv.ELECTRON_RUN_AS_NODE
   try {
-    for (const phase of ['populate', 'reopen']) {
-      const result = spawnSync(require('electron'), [__filename, temp.path, phase], {
+    for (const phase of searchOnly ? ['populate'] : ['populate', 'reopen']) {
+      const result = spawnSync(require('electron'), [__filename, ...(searchOnly ? ['--search-only'] : []), temp.path, phase], {
         stdio: 'inherit',
         timeout: 45_000,
         env: desktopEnv,
@@ -19,6 +20,10 @@ if (!process.versions.electron) {
       if (result.error) throw result.error
       if (result.status !== 0) process.exitCode = result.status || 1
       if (process.exitCode) break
+      if (phase === 'populate') {
+        const images = join(temp.path, 'Image Fixtures')
+        writeFileSync(join(images, 'While Closed.png'), readFileSync(join(images, 'Console Comparison.png')))
+      }
     }
   } finally {
     temp.remove()
@@ -102,7 +107,10 @@ if (!process.versions.electron) {
         const rect = document.querySelector(${JSON.stringify(selector)}).getBoundingClientRect()
         return { x: Math.round(rect.left + rect.width / 2), y: Math.round(rect.top + rect.height / 2) }
       })()`)
-      assert.equal(await evaluate(`document.elementFromPoint(${x}, ${y})?.getAttribute('aria-label')`), label)
+      const hit = await evaluate(`document.elementsFromPoint(${x}, ${y}).map(element => ({
+        element: element.tagName, classes: element.getAttribute('class'), label: element.getAttribute('aria-label'),
+      }))`)
+      assert.equal(hit[0]?.label, label, JSON.stringify({ x, y, hit }))
       win.focus()
       const handle = 'document.querySelector(' + JSON.stringify(selector) + ')'
       const previousValue = await evaluate(handle + ".getAttribute('aria-valuenow')")
@@ -170,7 +178,7 @@ if (!process.versions.electron) {
       await waitForCard('PS4 Startup.wav')
       await click(card('Console Comparison.png'))
       await until('image decode', `document.querySelector('.preview-surface img')?.naturalWidth === 96`)
-      await until('scaled image thumbnail and dimensions', `
+      if (!searchOnly) await until('scaled image thumbnail and dimensions', `
         document.querySelector(${JSON.stringify(card('Console Comparison.png') + ' .thumbnail img')})?.src.startsWith('data:image/webp') &&
         (${row('Console Comparison.png')})?.textContent.includes('96 × 54') &&
         document.querySelector('.file-details')?.textContent.includes('96 × 54')`)
@@ -205,6 +213,9 @@ if (!process.versions.electron) {
       await click('.folder-link[title$="Image Fixtures"]')
       await until('folder-scoped view', `document.querySelector('h1')?.textContent === 'Image Fixtures' &&
         !document.querySelector(${JSON.stringify(card('PS4 Startup.wav'))})`)
+      await text('#folder-search', 'title')
+      await until('folder search filters the current folder', `document.querySelector('.result-summary')?.textContent.includes('1 asset') &&
+        document.querySelector('h1')?.textContent.includes('and subfolders') && !!(${row('Title.mogrt')})`)
       await click('.search-field')
       assert.equal(await evaluate(`document.activeElement.getAttribute('aria-label')`), 'Search all assets')
       await key('.app', 'k', true)
@@ -214,6 +225,7 @@ if (!process.versions.electron) {
         document.querySelector('.result-summary')?.textContent.includes('2 assets') &&
         !!document.querySelector(${JSON.stringify(card('Console Comparison.png'))}) &&
         !!document.querySelector(${JSON.stringify(card('PS4 Startup.wav'))})`)
+      assert.equal(await evaluate(`document.querySelector('#folder-search').disabled && document.querySelector('#folder-search').value === 'title'`), true)
       await click('.quick-filters button:nth-child(2)')
       await until('Audio filter applies to both views', `document.querySelector('.asset-grid').children.length === 1 &&
         document.querySelector('.asset-table tbody').rows.length === 1 && !!(${row('PS4 Startup.wav')})`)
@@ -226,25 +238,83 @@ if (!process.versions.electron) {
       assert.equal(await evaluate(`document.querySelector('[aria-label="Additional filters"]').getAttribute('aria-expanded')`), 'false')
       await waitForCard('PS4 Startup.wav')
       await clickRow('PS4 Startup.wav')
-      await until('WAV metadata', `document.querySelector('audio')?.duration === 2`)
-      await evaluate(`document.querySelector('audio').play().then(() => true)`, true)
-      await until('audio playback', `document.querySelector('audio')?.currentTime > 0.1`)
-      await evaluate(`document.querySelector('audio').pause(); document.querySelector('audio').currentTime = 1.5`)
-      await until('audio seek', `document.querySelector('audio')?.currentTime === 1.5 && !document.querySelector('audio').seeking`)
-      await click('.quick-filters button:first-child')
+      if (!searchOnly) {
+        await until('WAV metadata', `document.querySelector('audio')?.duration === 2`)
+        await evaluate(`document.querySelector('audio').play().then(() => true)`, true)
+        await until('audio playback', `document.querySelector('audio')?.currentTime > 0.1`)
+        await evaluate(`document.querySelector('audio').pause(); document.querySelector('audio').currentTime = 1.5`)
+        await until('audio seek', `document.querySelector('audio')?.currentTime === 1.5 && !document.querySelector('audio').seeking`)
+      }
       await key('[aria-label="Search all assets"]', 'Escape')
+      await until('restored folder query retains the Audio filter', `document.querySelector('h1')?.textContent.includes('title') &&
+        document.querySelector('.result-summary')?.textContent.includes('0 assets') &&
+        document.querySelector('.empty-view')?.textContent.includes('this folder or its subfolders')`)
+      await click('.folder-link[title$="Sound Effects"]')
+      await until('folder query follows navigation', `document.querySelector('h1')?.textContent.includes('Sound Effects and subfolders') &&
+        document.querySelector('#folder-search').value === 'title'`)
+      await click('[aria-label="Library collections"] button:first-child')
+      await until('All Assets ignores the saved folder query', `document.querySelector('h1')?.textContent === 'All Assets' &&
+        document.querySelector('#folder-search').disabled && document.querySelector('.result-summary')?.textContent.includes('1 asset') &&
+        !!(${row('PS4 Startup.wav')})`)
+      await click('.folder-link[title$="Image Fixtures"]')
+      await click('.quick-filters button:first-child')
+      await until('clearing filters restores the saved folder match', `!!(${row('Title.mogrt')})`)
+      await click('[aria-label="Clear folder search"]')
       await until('search restores folder view', `document.querySelector('h1')?.textContent === 'Image Fixtures'`)
-      await waitForCard('Fixture Video.webm')
-      await until('generated WebM thumbnail', `document.querySelector(${JSON.stringify(card('Fixture Video.webm') + ' .thumbnail img')})?.src.startsWith('data:image/webp')`)
-      await click(card('Fixture Video.webm'))
-      await until('video decode', `document.querySelector('video')?.videoWidth === 96`)
-      await evaluate(`document.querySelector('video').play().then(() => true)`, true)
-      await until('video playback', `document.querySelector('video')?.currentTime > 0.1`)
-      await click(card('Title.mogrt'))
-      await until('template fallback', `document.querySelector('.preview-fallback')?.textContent.includes('MOGRT')`)
+      if (!searchOnly) {
+        await waitForCard('Fixture Video.webm')
+        await until('generated WebM thumbnail', `document.querySelector(${JSON.stringify(card('Fixture Video.webm') + ' .thumbnail img')})?.src.startsWith('data:image/webp')`)
+        await click(card('Fixture Video.webm'))
+        await until('video decode', `document.querySelector('video')?.videoWidth === 96`)
+        await evaluate(`document.querySelector('video').play().then(() => true)`, true)
+        await until('video playback', `document.querySelector('video')?.currentTime > 0.1`)
+        await click(card('Title.mogrt'))
+        await until('template fallback', `document.querySelector('.preview-fallback')?.textContent.includes('MOGRT')`)
+      }
+
+      const live = join(images, 'Sync Clips')
+      const liveFile = join(live, 'Live Console.wav')
+      const renamedFile = join(live, 'Live Console Renamed.wav')
+      await text('#folder-search', 'live console')
+      await click('.quick-filters button:nth-child(2)')
+      await until('empty active search before adding media', `document.querySelector('.result-summary')?.textContent.includes('0 assets')`)
+      mkdirSync(live)
+      writeFileSync(liveFile, audioBytes)
+      await until('new nested file appears in both active search views', `!!document.querySelector(${JSON.stringify(card('Live Console.wav'))}) &&
+        !!(${row('Live Console.wav')}) && [...document.querySelectorAll('.folder-link')].some(button => button.textContent === 'Sync Clips')`)
+      await clickRow('Live Console.wav')
+      await text('[aria-label="Search all assets"]', 'live console')
+      await until('global override uses the same live index', `document.querySelector('h1')?.textContent.endsWith('All Assets') &&
+        document.querySelector('.result-summary')?.textContent.includes('1 asset')`)
+      renameSync(liveFile, renamedFile)
+      await until('rename refreshes the selected asset and active search', `
+        document.querySelector('.inspector-title')?.textContent === 'Live Console Renamed.wav' &&
+        document.querySelector('.result-summary')?.textContent.includes('1 asset') &&
+        (${row('Live Console Renamed.wav')})?.getAttribute('aria-selected') === 'true'`)
+      await key('[aria-label="Search all assets"]', 'Escape')
+      await until('restored folder search sees the renamed file', `document.querySelector('h1')?.textContent.includes('and subfolders') &&
+        document.querySelector('.result-summary')?.textContent.includes('1 asset')`)
+      unlinkSync(renamedFile)
+      rmdirSync(live)
+      await until('deletion updates the selected inspector, results and tree', `
+        document.querySelector('.preview-fallback')?.textContent.includes('File missing') &&
+        document.querySelector('.result-summary')?.textContent.includes('0 assets') &&
+        document.querySelector('#folder-search').value === 'live console' &&
+        document.querySelector('.quick-filters button:nth-child(2)').getAttribute('aria-pressed') === 'true' &&
+        ![...document.querySelectorAll('.folder-link')].some(button => button.textContent === 'Sync Clips')`)
+      await until('sync indicator settles', `document.querySelector('.sync-status')?.textContent === 'Synced'`)
+      await click('.quick-filters button:first-child')
+      await key('#folder-search', 'Escape')
+      await until('sync preserves the folder scope', `document.querySelector('h1')?.textContent === 'Image Fixtures'`)
+      if (searchOnly) {
+        console.log('Desktop dual search, filters, scope restoration and live index updates passed.')
+        return
+      }
       await click('.sidebar-bottom button')
       await click('.settings-root:first-child button')
       await until('rescan result', `document.querySelector('.settings-scan-status')?.textContent.includes('6 assets indexed')`)
+      await evaluate(`[...document.querySelectorAll('.settings button')].find(button => button.textContent === 'Refresh Library').click()`)
+      await until('manual refresh result', `document.querySelector('.settings-scan-status')?.textContent.includes('2 linked folders refreshed')`)
       await click('[aria-label="Close settings"]')
       assert.deepEqual(readFileSync(wav), audioBytes)
       assert.deepEqual(readFileSync(png), pngBytes)
@@ -269,7 +339,7 @@ if (!process.versions.electron) {
       assert.equal(await measure('.sidebar'), 290)
       assert.equal(await measure('.inspector-pane'), 340)
       assert.equal(await evaluate(`document.querySelector('.table-scroll').clientWidth >= document.querySelector('.asset-table').offsetWidth`), true)
-      assert.equal(await evaluate(`document.querySelector('.search-field').offsetHeight`), 64)
+      assert.equal(await evaluate(`document.querySelector('.search-field').offsetHeight`), 256)
       if (process.env.BINWISE_SMOKE_SCREENSHOT) writeFileSync(process.env.BINWISE_SMOKE_SCREENSHOT, (await win.webContents.capturePage()).toPNG())
 
       win.setContentSize(960, 640)
@@ -283,6 +353,8 @@ if (!process.versions.electron) {
 
       win.setContentSize(1440, 920)
       await until('restored test viewport', 'innerWidth === 1440 && innerHeight === 920')
+      await waitFor('restored panel widths', async () =>
+        await measure('.sidebar') === 290 && await measure('.inspector-pane') === 340)
       await resizeByMouse('Resize sidebar', 32, 0)
       await waitFor('sidebar pointer resize', async () => await measure('.sidebar') === 322)
       await key('[aria-label="Resize inspector"]', 'ArrowLeft')
@@ -294,7 +366,7 @@ if (!process.versions.electron) {
       await until('grid/table pointer split', `Number(document.querySelector('[aria-label="Resize grid and table"]').getAttribute('aria-valuenow')) < 65`)
       await click('[aria-label="Grid only"]')
       await until('table collapses', `!document.querySelector('.table-pane')`)
-      console.log('Desktop search, filters, ordering, shared selection, notes, previews, drag request, rescans and wide/narrow layout passed.')
+      console.log('Desktop search, live folder and asset updates, selection, metadata, media, drag request, refresh and layout passed.')
     } else {
       await waitForCard('Console Comparison.png')
       await click(card('Console Comparison.png'))
@@ -310,7 +382,11 @@ if (!process.versions.electron) {
       await click('[aria-label="Grid and table"]')
       await until('table reopens with its saved split', `Number(document.querySelector('[aria-label="Resize grid and table"]')?.getAttribute('aria-valuenow')) < 65 &&
         (${row('Console Comparison.png')})?.getAttribute('aria-selected') === 'true'`)
-      console.log('Desktop restart restored linked folders, notes, tags, favourites, category, sort, panel widths and table visibility/split.')
+      await waitForCard('While Closed.png')
+      writeFileSync(join(images, 'After Restart.png'), readFileSync(png))
+      await waitForCard('After Restart.png')
+      await until('restored watches settle', `document.querySelector('.sync-status')?.textContent === 'Synced'`)
+      console.log('Desktop restart restored watchers, caught up on offline changes and preserved metadata and layout.')
     }
   }
 

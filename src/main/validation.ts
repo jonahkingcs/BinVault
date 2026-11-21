@@ -44,9 +44,15 @@ export function validateQuery(value: unknown): AssetQuery {
   if (query.favouritesOnly !== undefined && typeof query.favouritesOnly !== 'boolean') {
     throw new Error('Invalid favourites filter.')
   }
+  const scope = validateScope(query.scope)
+  if (query.searchWithinFolder !== undefined &&
+    (query.searchWithinFolder !== true || scope.type !== 'folder' || !query.search.trim())) {
+    throw new Error('Folder search requires a folder and search text.')
+  }
   return {
     search: query.search,
-    scope: validateScope(query.scope),
+    scope,
+    searchWithinFolder: query.searchWithinFolder,
     sort: oneOf(query.sort, assetSorts),
     offset: query.offset,
     category: query.category === undefined ? undefined : oneOf(query.category, categories),

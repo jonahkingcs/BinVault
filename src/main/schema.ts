@@ -65,12 +65,20 @@ function createVersionOne(db: DatabaseSync): void {
 
 export function migrate(db: DatabaseSync): void {
   const version = Number(db.prepare('PRAGMA user_version').get()?.user_version)
-  if (version > 2) throw new Error('This library was created by a newer version of Binwise.')
+  if (version > 3) throw new Error('This library was created by a newer version of Binwise.')
   if (version === 0) createVersionOne(db)
   if (version < 2) db.exec(`
     BEGIN;
     ALTER TABLE assets ADD COLUMN notes TEXT NOT NULL DEFAULT '';
     PRAGMA user_version = 2;
+    COMMIT;
+  `)
+  if (version < 3) db.exec(`
+    BEGIN;
+    ALTER TABLE assets ADD COLUMN file_identity TEXT NOT NULL DEFAULT '';
+    ALTER TABLE assets ADD COLUMN confirmed_missing INTEGER NOT NULL DEFAULT 0 CHECK (confirmed_missing IN (0, 1));
+    CREATE INDEX missing_identity ON assets(file_identity) WHERE confirmed_missing = 1 AND file_identity <> '';
+    PRAGMA user_version = 3;
     COMMIT;
   `)
 }

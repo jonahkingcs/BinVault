@@ -131,7 +131,7 @@ const observer = new IntersectionObserver(entries => {
 
 export function useMediaDetails(asset: Asset, ref: RefObject<HTMLElement | null>): MediaDetails {
   const { id, modifiedAt, extension, size } = asset
-  const key = id + ':' + modifiedAt + ':' + size
+  const key = id + ':' + modifiedAt + ':' + size + ':' + extension
   const [current, setCurrent] = useState<{ key: string; details: MediaDetails }>()
   const canPreview = Boolean(asset.available && previewKind(extension))
   useEffect(() => {

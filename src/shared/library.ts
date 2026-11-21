@@ -53,6 +53,7 @@ export type LibraryScope =
 export interface AssetQuery {
   search: string
   scope: LibraryScope
+  searchWithinFolder?: true
   category?: Category
   kind?: FileKind
   fileType?: QuickFileType
@@ -87,12 +88,29 @@ export interface ScanReport {
   skipped: number
 }
 
+export interface RefreshReport {
+  reports: ScanReport[]
+  failed: number[]
+}
+
+export interface LibrarySyncStatus {
+  revision: number
+  folderRevision: number
+  syncing: boolean
+  limitedRoots: number
+}
+
 export interface BinwiseApi {
   getLibrary(): Promise<LibrarySummary>
   getFolders(folderId: number): Promise<FolderNode[]>
   getAssets(query: AssetQuery): Promise<AssetPage>
+  getAsset(id: number): Promise<Asset | null>
   importFolder(): Promise<ScanReport | null>
   rescan(rootId: number): Promise<ScanReport>
+  refreshLibrary(): Promise<RefreshReport>
+  unlinkFolder(rootId: number): Promise<void>
+  getSyncStatus(): Promise<LibrarySyncStatus>
+  onSyncStatus(listener: (status: LibrarySyncStatus) => void): () => void
   updateAsset(id: number, patch: AssetPatch): Promise<Asset>
   revealAsset(id: number): Promise<void>
   copyPath(id: number): Promise<void>

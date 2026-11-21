@@ -25,13 +25,15 @@ The initial dependency install and first Electron launch download the developmen
 ## Use the library
 
 1. Choose **Import Folder** and select an existing assets folder. Repeat for additional folders. Binwise indexes the supported files in place.
-2. Browse the linked folder tree or press **Ctrl+K** for Quick Search. Search looks through filenames, categories, original folder paths, and tags across the library. The toolbar’s filters still apply. Clear search to return to the current folder or collection.
+2. Press **Ctrl+K** for global Quick Search, or select a linked folder and use **Folder search** above the results to include that folder and its subfolders. Both fields match filenames, categories, original folder paths, and tags, and respect toolbar filters. Global Quick Search takes priority. Clearing it resumes your folder query or returns to normal browsing. The folder query follows you when you select another linked folder.
 3. Select a thumbnail or table row to preview the asset, edit its category, tags, or notes, or mark it as a favourite. Notes save automatically after a brief pause or when you leave the field. Use **Open in Explorer** to reveal the original file or **Copy Path** to copy its absolute path.
-4. Use **Settings → Linked folders → Rescan** after adding, removing, or moving files outside Binwise. Settings also controls the image preview checkerboard. **Recently Added** covers the last 30 days.
+4. Binwise watches linked folders and their subfolders while it is open. The footer shows **Syncing**, **Synced**, or **Sync limited**. Use **Settings → Linked folders → Refresh Library** to reconcile all folders on demand, or **Rescan** for a single folder. Settings also controls the image preview checkerboard. **Recently Added** covers the last 30 days.
 
 Drag the sidebar and inspector boundaries or the grid/table divider to resize the workspace. The dividers also support arrow keys when focused. Use the layout buttons to show both views, the grid alone, or the table alone. Arrow keys move between assets, and Enter selects the focused file for preview. Panel widths, split, layout, and sorting are remembered.
 
-The library database is stored in `%APPDATA%\Binwise\library.sqlite`. Linked folders and metadata are restored from it on restart. Existing libraries migrate in place on first launch with notes support. Development and packaged builds use the same library by default. For an isolated run, use Electron’s `--user-data-dir` switch with a separate directory.
+The library database is stored in `%APPDATA%\Binwise\library.sqlite`. Linked folders and metadata are restored from it on restart. Existing libraries migrate in place. Development and packaged builds use the same library by default. For an isolated run, use Electron’s `--user-data-dir` switch with a separate directory.
+
+To verify synchronisation, link a disposable folder and leave a search open for a unique name. In Explorer, create a subfolder and copy an image, audio file, or video with that name into it. Check that the folder tree, active results, and counts update after the copy settles. Select the result, then rename or remove it in Explorer to check that the inspector follows the rename or shows the file as missing. Restart Binwise and repeat with another file. To check drive recovery, use a disposable library on a removable drive, disconnect it, and reconnect it before trying **Refresh Library**.
 
 ## Verify Windows native drag and Premiere Pro
 
@@ -46,7 +48,8 @@ Automated verification checks that the renderer reaches the native drag API with
 
 ## Current limits
 
-- Scans are manual. A file moved or renamed to a new path gets a new entry, while the missing record retains its metadata. Rescanning restores the original record if the file returns to its old path.
+- Renames and moves preserve metadata when Binwise can match a single destination to a missing original using the filesystem’s file identity. A cross-volume copy followed by deletion, or a filesystem without stable file identities, may create a new entry. The original metadata is retained and restored if the file returns to its previous path. Missing files are excluded from active results and counts.
+- Some removable and network filesystems may deliver limited notifications. Binwise retries unavailable watches and reconciles linked folders on startup and reconnection. **Refresh Library** can pick up missed changes on demand.
 - Previews depend on the codecs bundled with Electron. The grid builds scaled thumbnails for supported images and videos and uses file-type icons for other formats. Thumbnails are cached for the session. Waveforms, sample rates, bitrates, and frame rates aren’t currently displayed.
 - The Windows package is an unpacked build. Installer distribution, code signing, and automatic updates are deferred.
 - The desktop smoke test substitutes the picker response and clipboard write and captures the native drag request. It exercises the actual app, disk files, SQLite, and Chromium media elements.

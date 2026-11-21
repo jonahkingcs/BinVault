@@ -17,6 +17,10 @@ test('validates renderer data and treats paths and SQL as outside the IPC contra
     search: '', scope: { type: 'collection', collection: 'all' }, offset: 0, sort: 'a.name; DROP TABLE assets',
   }))
   assert.throws(() => validatePatch({ addTag: 'line\nbreak' }))
+  const query = { search: 'ps4', sort: 'relevance', offset: 0, searchWithinFolder: true }
+  assert.throws(() => validateQuery({ ...query, scope: { type: 'collection', collection: 'all' } }), /requires a folder/)
+  assert.throws(() => validateQuery({ ...query, search: '  ', scope: { type: 'folder', folderId: 1 } }), /search text/)
+  assert.equal(validateQuery({ ...query, scope: { type: 'folder', folderId: 1 } }).searchWithinFolder, true)
   assert.throws(() => validatePatch({ absolutePath: 'C:\\test.wav' }))
   assert.throws(() => validatePatch({ notes: 'embedded\0null' }))
   assert.throws(() => validatePatch({ notes: 'x'.repeat(8001) }))

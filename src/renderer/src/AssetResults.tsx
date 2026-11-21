@@ -99,7 +99,8 @@ interface AssetResultsProps {
   loading: boolean
   failed: boolean
   emptyLibrary: boolean
-  searching: boolean
+  searchTerm: string
+  searchWithinFolder: boolean
   layout: BrowserLayout
   split: number
   offset: number
@@ -115,7 +116,7 @@ export const minSplit = 25
 export const maxSplit = 80
 
 export const AssetResults = memo(function AssetResults({
-  page, resultKey, selectedId, loading, failed, emptyLibrary, searching, layout, split, offset,
+  page, resultKey, selectedId, loading, failed, emptyLibrary, searchTerm, searchWithinFolder, layout, split, offset,
   onSelect, onFavourite, onImport, onPage, onRetry, onSplit,
 }: AssetResultsProps) {
   const gallery = useRef<HTMLDivElement>(null)
@@ -166,13 +167,15 @@ export const AssetResults = memo(function AssetResults({
   }
   if (!page || (!assets.length && loading)) return <div className="empty-view" role="status">Loading assets…</div>
   if (!assets.length) {
-    const link = emptyLibrary && !searching
+    const link = emptyLibrary && !searchTerm
     return (
       <div className="empty-view">
         {link ? <FolderOpen size={30} /> : <FileSearch size={29} />}
-        <h2>{link ? 'Link your first asset folder' : searching ? 'No matching assets' : 'No assets in this view'}</h2>
+        <h2>{link ? 'Link your first asset folder' : searchTerm ? 'No matching assets' : 'No assets in this view'}</h2>
         <p>{link ? 'Browse the editing assets you already keep on this PC.'
-          : searching ? 'Try a different filename, folder, category or tag.' : 'Change the filters or choose another folder.'}</p>
+          : searchTerm ? 'No assets matching “' + searchTerm + '” found in ' +
+            (searchWithinFolder ? 'this folder or its subfolders.' : 'this library.')
+            : 'Change the filters or choose another folder.'}</p>
         {link && <button className="button primary" onClick={onImport}><FolderPlus size={15} />Import Folder</button>}
       </div>
     )

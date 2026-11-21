@@ -12,14 +12,15 @@ interface FolderBranchProps {
   folder: FolderNode
   depth: number
   revision: number
+  rootId: number
   activeId?: number
   rootPath?: string
   parentTrail?: string
-  onSelect: (scope: LibraryScope, label: string) => void
+  onSelect: (scope: LibraryScope, label: string, rootId?: number) => void
   onError: (message: string) => void
 }
 
-const FolderBranch = memo(function FolderBranchView({ folder, depth, revision, activeId, rootPath, parentTrail, onSelect, onError }: FolderBranchProps) {
+const FolderBranch = memo(function FolderBranchView({ folder, depth, revision, rootId, activeId, rootPath, parentTrail, onSelect, onError }: FolderBranchProps) {
   const [open, setOpen] = useState(depth === 0)
   const [children, setChildren] = useState<FolderNode[]>([])
   const expanded = folder.hasChildren && open
@@ -47,7 +48,7 @@ const FolderBranch = memo(function FolderBranchView({ folder, depth, revision, a
         ) : <span className="tree-spacer" />}
         <button
           className="folder-link" title={rootPath ?? folder.relativePath} aria-current={active ? 'page' : undefined}
-          onClick={() => onSelect({ type: 'folder', folderId: folder.id }, trail)}
+          onClick={() => onSelect({ type: 'folder', folderId: folder.id }, trail, rootId)}
         >
           <FolderIcon size={15} />
           <span className="truncate">{folder.name}</span>
@@ -57,7 +58,7 @@ const FolderBranch = memo(function FolderBranchView({ folder, depth, revision, a
         <ul className="m-0 list-none p-0">
           {children.map(child => (
             <FolderBranch
-              key={child.id} folder={child} depth={depth + 1} activeId={activeId}
+              key={child.id} folder={child} depth={depth + 1} activeId={activeId} rootId={rootId}
               revision={revision} parentTrail={trail} onSelect={onSelect} onError={onError}
             />
           ))}
@@ -70,20 +71,19 @@ const FolderBranch = memo(function FolderBranchView({ folder, depth, revision, a
 interface SidebarProps {
   summary: LibrarySummary | null
   scope: LibraryScope
-  searching: boolean
   folderRevision: number
-  onSelect: (scope: LibraryScope, label: string) => void
+  onSelect: (scope: LibraryScope, label: string, rootId?: number) => void
   onOpenSettings: () => void
   onError: (message: string) => void
   quickSearch: ReactNode
   resizeHandle: ReactNode
 }
 
-export function Sidebar({ summary, scope, searching, folderRevision, onSelect, onOpenSettings, onError, quickSearch, resizeHandle }: SidebarProps) {
+export function Sidebar({ summary, scope, folderRevision, onSelect, onOpenSettings, onError, quickSearch, resizeHandle }: SidebarProps) {
   const [categoriesOpen, setCategoriesOpen] = useState(true)
-  const collection = !searching && scope.type === 'collection' ? scope.collection : undefined
-  const category = !searching && scope.type === 'category' ? scope.category : undefined
-  const activeId = !searching && scope.type === 'folder' ? scope.folderId : undefined
+  const collection = scope.type === 'collection' ? scope.collection : undefined
+  const category = scope.type === 'category' ? scope.category : undefined
+  const activeId = scope.type === 'folder' ? scope.folderId : undefined
   return (
     <aside className="sidebar" id="library-sidebar" aria-label="Library navigation">
       {quickSearch}
@@ -132,7 +132,7 @@ export function Sidebar({ summary, scope, searching, folderRevision, onSelect, o
             {summary && !summary.roots.length && <p className="sidebar-empty">No folders linked</p>}
             <ul className="m-0 list-none p-0">
               {summary?.roots.map(root => (
-                <FolderBranch key={root.id} folder={root.folder} rootPath={root.path} depth={0}
+                <FolderBranch key={root.id} folder={root.folder} rootId={root.id} rootPath={root.path} depth={0}
                   revision={folderRevision} activeId={activeId} onSelect={onSelect} onError={onError} />
               ))}
             </ul>

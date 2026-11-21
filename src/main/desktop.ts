@@ -4,6 +4,7 @@ import { ipc } from '../shared/ipc'
 import { checkedFilePath } from './paths'
 import { validateId, validatePatch, validateQuery } from './validation'
 import type { Library } from './library'
+import type { FolderSync } from './folderSync'
 
 function createDragIcon() {
   const size = 32
@@ -17,7 +18,7 @@ function createDragIcon() {
   return nativeImage.createFromBitmap(pixels, { width: size, height: size })
 }
 
-export function registerLibraryIpc(library: Library, getWindow: () => BrowserWindow | null, pageUrl: string): void {
+export function registerLibraryIpc(library: Library, sync: FolderSync, getWindow: () => BrowserWindow | null, pageUrl: string): void {
   const dragIcon = createDragIcon()
   let importing = false
 
@@ -37,6 +38,8 @@ export function registerLibraryIpc(library: Library, getWindow: () => BrowserWin
   handle(ipc.getLibrary, () => library.getLibrary())
   handle(ipc.getFolders, id => library.getFolders(validateId(id)))
   handle(ipc.getAssets, query => library.getAssets(validateQuery(query)))
+  handle(ipc.getAsset, id => library.findAsset(validateId(id)))
+  handle(ipc.getSyncStatus, () => sync.getStatus())
   handle(ipc.importFolder, async () => {
     const window = getWindow()
     if (!window || importing) return null
@@ -48,12 +51,14 @@ export function registerLibraryIpc(library: Library, getWindow: () => BrowserWin
         properties: ['openDirectory', 'dontAddToRecent'],
       })
       const folder = result.filePaths[0]
-      return result.canceled || !folder ? null : await library.importFolder(folder)
+      return result.canceled || !folder ? null : await sync.importFolder(folder)
     } finally {
       importing = false
     }
   })
-  handle(ipc.rescan, id => library.rescan(validateId(id)))
+  handle(ipc.rescan, id => sync.rescan(validateId(id)))
+  handle(ipc.refreshLibrary, () => sync.refresh())
+  handle(ipc.unlinkFolder, id => sync.unlinkFolder(validateId(id)))
   handle(ipc.updateAsset, (id, patch) => library.updateAsset(validateId(id), validatePatch(patch)))
   handle(ipc.revealAsset, async id => {
     const asset = library.getAsset(validateId(id))

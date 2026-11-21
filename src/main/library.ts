@@ -1,4 +1,4 @@
-import { basename, dirname } from 'node:path'
+import { basename, dirname, join, relative, sep } from 'node:path'
 import { realpath } from 'node:fs/promises'
 import { DatabaseSync } from 'node:sqlite'
 import type { SQLInputValue } from 'node:sqlite'
@@ -10,7 +10,7 @@ import type {
   LibrarySummary, ScanReport,
 } from '../shared/library.ts'
 import { migrate } from './schema.ts'
-import { hasErrorCode, pathKey, relativeKey, scanFolder } from './paths.ts'
+import { containsPath, pathKey, readRootIdentity, relativeKey, scanFolder } from './paths.ts'
 import type { FolderSnapshot } from './paths.ts'
 
 const recentWindow = 30 * 24 * 60 * 60 * 1000
@@ -51,6 +51,23 @@ interface FolderRow {
   has_children: number
 }
 
+interface RootRow {
+  id: number
+  path: string
+  name: string
+}
+
+interface ScopedScan {
+  root: RootRow
+  snapshot: FolderSnapshot
+}
+
+const activeAsset = 'EXISTS (SELECT 1 FROM locations active WHERE active.asset_id = a.id AND active.available = 1)'
+
+function descendants(key: string, separator: string): [string, string] {
+  return [key + separator, key + String.fromCharCode(separator.charCodeAt(0) + 1)]
+}
+
 const selectAsset = `
   SELECT a.*, r.path AS root_path, f.relative_path, l.available,
     (SELECT json_group_array(name) FROM (
@@ -88,6 +105,8 @@ function searchText(value: string): string {
 export class Library {
   private readonly db: DatabaseSync
   private scanning = false
+  revision = 0
+  folderRevision = 0
 
   constructor(databasePath: string) {
     this.db = new DatabaseSync(databasePath)
@@ -116,10 +135,10 @@ export class Library {
     })[]
     const totals = this.db.prepare(`
       SELECT count(*) AS total, coalesce(sum(favourite), 0) AS favourites,
-        coalesce(sum(added_at >= ?), 0) AS recent FROM assets
+        coalesce(sum(added_at >= ?), 0) AS recent FROM assets a WHERE ${activeAsset}
     `).get(Date.now() - recentWindow)!
     const categoryCounts = Object.fromEntries(categories.map(category => [category, 0])) as Record<Category, number>
-    for (const row of this.db.prepare('SELECT category, count(*) AS total FROM assets GROUP BY category').all()) {
+    for (const row of this.db.prepare(`SELECT category, count(*) AS total FROM assets a WHERE ${activeAsset} GROUP BY category`).all()) {
       categoryCounts[row.category as Category] = Number(row.total)
     }
     return {
@@ -142,7 +161,7 @@ export class Library {
   }
 
   getAssets(query: AssetQuery): AssetPage {
-    const conditions: string[] = []
+    const conditions: string[] = [activeAsset]
     const params: SQLInputValue[] = []
     let searchJoin = ''
     let order = sortSql[query.sort]
@@ -166,14 +185,15 @@ export class Library {
         conditions.push(`EXISTS (SELECT 1 FROM asset_search s WHERE s.rowid = a.id AND ${matches.join(' AND ')})`)
         params.push(...short.flatMap(term => [term, term, term, term]))
       }
-    } else {
+    }
+    if (query.searchWithinFolder || !terms.length) {
       const scope = query.scope
       if (scope.type === 'folder') {
         conditions.push(`EXISTS (
           SELECT 1 FROM folders target
           JOIN locations loc ON loc.root_id = target.root_id AND loc.asset_id = a.id
           JOIN folders f ON f.id = loc.folder_id
-          WHERE target.id = ? AND (
+          WHERE target.id = ? AND target.present = 1 AND loc.available = 1 AND (
             target.path_key = '' OR f.path_key = target.path_key OR
             substr(f.path_key, 1, length(target.path_key) + 1) = target.path_key || '/'
           )
@@ -217,9 +237,14 @@ export class Library {
   }
 
   getAsset(id: number): Asset {
+    const asset = this.findAsset(id)
+    if (!asset) throw new Error('This asset is no longer in the library.')
+    return asset
+  }
+
+  findAsset(id: number): Asset | null {
     const row = this.db.prepare(`${selectAsset} WHERE a.id = ?`).get(id) as unknown as AssetRow | undefined
-    if (!row) throw new Error('This asset is no longer in the library.')
-    return toAsset(row)
+    return row ? toAsset(row) : null
   }
 
   updateAsset(id: number, patch: AssetPatch): Asset {
@@ -262,35 +287,117 @@ export class Library {
     })
   }
 
-  async importFolder(selectedPath: string): Promise<ScanReport> {
+  getLinkedRoots(): RootRow[] {
+    return this.db.prepare('SELECT id, path, name FROM roots').all() as unknown as RootRow[]
+  }
+
+  async importFolder(selectedPath: string, signal?: AbortSignal): Promise<ScanReport> {
     return this.runScan(async () => {
-      const rootPath = await realpath(selectedPath).catch(() => {
+      const path = await realpath(selectedPath).catch(() => {
         throw new Error('The selected folder could not be opened.')
       })
-      return this.saveSnapshot(await scanFolder(rootPath))
+      const snapshot = await scanFolder(path, { signal })
+      const root = this.getLinkedRoots().find(root => pathKey(root.path) === pathKey(path)) ??
+        { id: 0, path, name: basename(path) || path }
+      return this.saveFullScan(root, snapshot)
     })
   }
 
   async rescan(rootId: number): Promise<ScanReport> {
+    const { reports } = await this.rescanRoots([rootId])
+    if (!reports[0]) throw new Error('Could not rescan this folder. Check that the original location is connected and accessible.')
+    return reports[0]
+  }
+
+  async rescanRoots(rootIds: number[], signal?: AbortSignal): Promise<{ reports: ScanReport[]; failed: number[] }> {
     return this.runScan(async () => {
-      const root = this.db.prepare('SELECT path, name FROM roots WHERE id = ?').get(rootId)
-      if (!root) throw new Error('This linked folder is no longer in the library.')
-      let snapshot
-      try {
-        snapshot = await scanFolder(String(root.path))
-      } catch (error) {
-        if (hasErrorCode(error, 'ENOENT') || hasErrorCode(error, 'ENOTDIR')) {
-          this.db.prepare(`
-            UPDATE locations SET available = 0 WHERE asset_id IN (SELECT asset_id FROM locations WHERE root_id = ?)
-          `).run(rootId)
+      const roots = new Map(this.getLinkedRoots().map(root => [root.id, root]))
+      const scans: ScopedScan[] = []
+      const failed: number[] = []
+      for (const id of rootIds) {
+        const root = roots.get(id)
+        if (!root) {
+          failed.push(id)
+          continue
         }
-        throw new Error('Could not rescan this folder. Check that the original location is connected and accessible.')
+        try {
+          scans.push({ root, snapshot: await scanFolder(root.path, { signal }) })
+        } catch {
+          signal?.throwIfAborted()
+          this.markRootUnavailable(id)
+          failed.push(id)
+        }
       }
-      return this.saveSnapshot(snapshot)
+      this.saveScans(scans, true)
+      return { reports: scans.map(({ root, snapshot }) => this.scanReport(root, snapshot)), failed }
     })
   }
 
-  private async runScan(scan: () => Promise<ScanReport>): Promise<ScanReport> {
+  async reconcilePaths(paths: string[], stabilityMs: number, signal?: AbortSignal): Promise<{ pending: string[]; incomplete: number[] }> {
+    return this.runScan(async () => {
+      const roots = this.getLinkedRoots()
+      const scans: ScopedScan[] = []
+      const incomplete = new Set<number>()
+      const stableBefore = Date.now() - stabilityMs
+      for (const root of roots) {
+        const targets = paths.flatMap(path =>
+          containsPath(root.path, path) ? [path] : containsPath(path, root.path) ? [root.path] : [])
+        if (!targets.length) continue
+        try {
+          await readRootIdentity(root.path)
+        } catch {
+          signal?.throwIfAborted()
+          this.markRootUnavailable(root.id)
+          incomplete.add(root.id)
+          continue
+        }
+        const covered = new Set<string>()
+        const rootKey = pathKey(root.path)
+        for (const target of targets) {
+          const key = pathKey(target)
+          let ancestor = key
+          while (!covered.has(ancestor) && ancestor !== rootKey && dirname(ancestor) !== ancestor) {
+            ancestor = dirname(ancestor)
+          }
+          if (covered.has(ancestor)) continue
+          covered.add(key)
+          try {
+            const snapshot = await scanFolder(root.path, { target, stableBefore, signal })
+            if (snapshot.skipped.length > snapshot.pending.length) incomplete.add(root.id)
+            scans.push({ root, snapshot })
+          } catch (error) {
+            signal?.throwIfAborted()
+            this.markRootUnavailable(root.id)
+            incomplete.add(root.id)
+          }
+        }
+      }
+      this.saveScans(scans)
+      return { pending: scans.flatMap(scan => scan.snapshot.pending), incomplete: [...incomplete] }
+    })
+  }
+
+  markRootUnavailable(rootId: number): void {
+    const result = this.db.prepare(`
+      UPDATE locations SET available = 0 WHERE available = 1 AND
+        asset_id IN (SELECT asset_id FROM locations WHERE root_id = ?)
+    `).run(rootId)
+    if (result.changes) this.revision++
+  }
+
+  unlinkFolder(rootId: number): void {
+    this.transaction(() => {
+      this.db.prepare('DELETE FROM locations WHERE root_id = ?').run(rootId)
+      this.db.prepare('DELETE FROM folders WHERE root_id = ?').run(rootId)
+      if (!this.db.prepare('DELETE FROM roots WHERE id = ?').run(rootId).changes) {
+        throw new Error('This linked folder is no longer in the library.')
+      }
+    })
+    this.revision++
+    this.folderRevision++
+  }
+
+  private async runScan<T>(scan: () => Promise<T>): Promise<T> {
     if (this.scanning) throw new Error('A library scan is already running.')
     this.scanning = true
     try {
@@ -300,91 +407,197 @@ export class Library {
     }
   }
 
-  private saveSnapshot(snapshot: FolderSnapshot): ScanReport {
-    return this.transaction(() => {
-      const when = Date.now()
-      const rootName = basename(snapshot.rootPath) || snapshot.rootPath
-      const root = this.db.prepare(`
-        INSERT INTO roots (path, path_key, name, scanned_at) VALUES (?, ?, ?, ?)
-        ON CONFLICT (path_key) DO UPDATE SET path = excluded.path, name = excluded.name, scanned_at = excluded.scanned_at
-        RETURNING id
-      `).get(snapshot.rootPath, pathKey(snapshot.rootPath), rootName, when)!
-      const rootId = Number(root.id)
-      const upsertFolder = this.db.prepare(`
-        INSERT INTO folders (root_id, parent_id, relative_path, path_key, name) VALUES (?, ?, ?, ?, ?)
-        ON CONFLICT (root_id, path_key) DO UPDATE SET
-          relative_path = excluded.relative_path, name = excluded.name, present = 1
-        RETURNING id
-      `)
+  private saveFullScan(root: RootRow, snapshot: FolderSnapshot): ScanReport {
+    this.saveScans([{ root, snapshot }], true)
+    return this.scanReport(root, snapshot)
+  }
+
+  private scanReport(root: RootRow, snapshot: FolderSnapshot): ScanReport {
+    return { rootId: root.id, rootName: root.name, indexed: snapshot.files.length, skipped: snapshot.skipped.length }
+  }
+
+  private saveScans(scans: ScopedScan[], full = false): void {
+    if (!scans.length) return
+    const roots = this.getLinkedRoots()
+    const when = Date.now()
+    const observed = new Set(scans.flatMap(({ snapshot }) => snapshot.files.map(file => pathKey(file.absolutePath))))
+    const identityPaths = new Map<string, string>()
+    for (const { snapshot } of scans) {
+      for (const file of snapshot.files) {
+        if (!file.identity) continue
+        const key = pathKey(file.absolutePath)
+        const previous = identityPaths.get(file.identity)
+        identityPaths.set(file.identity, previous === undefined || previous === key ? key : '')
+      }
+    }
+
+    let changed = full
+    let foldersChanged = false
+    this.transaction(() => {
+      for (const { root } of scans) {
+        if (root.id) continue
+        root.id = Number(this.db.prepare('INSERT INTO roots (path, path_key, name, scanned_at) VALUES (?, ?, ?, 0)')
+          .run(root.path, pathKey(root.path), root.name).lastInsertRowid)
+        roots.push(root)
+      }
+      const findFolder = this.db.prepare('SELECT id, relative_path, name, present FROM folders WHERE root_id = ? AND path_key = ?')
+      const insertFolder = this.db.prepare(
+        'INSERT INTO folders (root_id, parent_id, relative_path, path_key, name) VALUES (?, ?, ?, ?, ?)',
+      )
+      const updateFolder = this.db.prepare('UPDATE folders SET relative_path = ?, name = ?, present = 1 WHERE id = ?')
       const folderIds = new Map<string, number>()
-      for (const folder of snapshot.folders) {
-        const key = relativeKey(folder.relativePath)
-        const parentId = folder.parentPath === null ? null : folderIds.get(relativeKey(folder.parentPath))!
-        const row = upsertFolder.get(rootId, parentId, folder.relativePath, key, folder.name)!
-        folderIds.set(key, Number(row.id))
+      function ensureFolder(root: RootRow, path: string, name = basename(path) || root.name): number {
+        const key = relativeKey(path)
+        const cacheKey = root.id + ':' + key
+        const cached = folderIds.get(cacheKey)
+        if (cached !== undefined) return cached
+        const existing = findFolder.get(root.id, key)
+        const parent = path && !existing?.present ? ensureFolder(root, path.slice(0, Math.max(0, path.lastIndexOf('/')))) : null
+        let id: number
+        if (existing) {
+          id = Number(existing.id)
+          if (existing.relative_path !== path || existing.name !== name || !existing.present) {
+            updateFolder.run(path, name, id)
+            foldersChanged = true
+          }
+        } else {
+          id = Number(insertFolder.run(root.id, parent, path, key, name).lastInsertRowid)
+          foldersChanged = true
+        }
+        folderIds.set(cacheKey, id)
+        return id
       }
 
+      const selectKnownPaths = 'SELECT a.id, a.path_key, f.path_key AS folder_key, a.name'
+      const assetScope = `
+        JOIN folders f ON f.id = l.folder_id
+        WHERE l.root_id = ? AND a.confirmed_missing = 0
+      `
+      const allAssets = this.db.prepare(`
+        ${selectKnownPaths} FROM locations l JOIN assets a ON a.id = l.asset_id ${assetScope}
+      `)
+      // Start with the asset path index for scoped updates, even in large linked roots.
+      const assetByPath = `
+        ${selectKnownPaths} FROM assets a CROSS JOIN locations l ON l.asset_id = a.id ${assetScope}
+      `
+      const scopedAssets = this.db.prepare(`
+        ${assetByPath} AND a.path_key = ?
+        UNION ALL
+        ${assetByPath} AND a.path_key >= ? AND a.path_key < ?
+      `)
+      const folderScope = 'SELECT id, path_key FROM folders WHERE root_id = ? AND present = 1'
+      const allFolders = this.db.prepare(folderScope)
+      const branchFolders = this.db.prepare(`
+        ${folderScope} AND path_key = ?
+        UNION ALL
+        ${folderScope} AND path_key >= ? AND path_key < ?
+      `)
+      const hideFolder = this.db.prepare('UPDATE folders SET present = 0 WHERE id = ?')
+      const markMissing = this.db.prepare('UPDATE assets SET confirmed_missing = 1 WHERE id = ?')
+      const hideAsset = this.db.prepare('UPDATE locations SET available = 0 WHERE asset_id = ? AND available = 1')
+      for (const { root, snapshot } of scans) {
+        const scope = relativeKey(snapshot.scope)
+        const skipped = new Set(snapshot.skipped.map(relativeKey))
+        function wasSkipped(path: string): boolean {
+          while (path) {
+            if (skipped.has(path)) return true
+            path = path.slice(0, Math.max(0, path.lastIndexOf('/')))
+          }
+          return skipped.has('')
+        }
+        const folderKeys = new Set(snapshot.folders.map(folder => relativeKey(folder.relativePath)))
+        const scopedFolders = scope
+          ? branchFolders.all(root.id, scope, root.id, ...descendants(scope, '/'))
+          : allFolders.all(root.id)
+        for (const folder of scopedFolders) {
+          const key = String(folder.path_key)
+          if (!folderKeys.has(key) && !wasSkipped(key)) {
+            hideFolder.run(folder.id!)
+            foldersChanged = true
+          }
+        }
+
+        const scopeKey = pathKey(join(root.path, snapshot.scope))
+        const rows = scope ? scopedAssets.all(root.id, scopeKey, root.id, ...descendants(scopeKey, sep)) : allAssets.all(root.id)
+        for (const row of rows) {
+          const folder = String(row.folder_key)
+          const file = relativeKey((folder ? folder + '/' : '') + row.name)
+          if (observed.has(String(row.path_key)) || wasSkipped(file)) continue
+          markMissing.run(row.id!)
+          changed = Boolean(hideAsset.run(row.id!).changes) || changed
+        }
+      }
+
+      const findAsset = this.db.prepare('SELECT id, absolute_path, name FROM assets WHERE path_key = ?')
+      const findMove = this.db.prepare(`
+        SELECT id, path_key FROM assets WHERE file_identity = ? AND confirmed_missing = 1 AND file_identity <> '' LIMIT 2
+      `)
       const insertAsset = this.db.prepare(`
-        INSERT INTO assets (absolute_path, path_key, name, extension, kind, category, size, added_at, modified_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(path_key) DO NOTHING RETURNING id
+        INSERT INTO assets (absolute_path, path_key, name, extension, kind, category, size, added_at, modified_at, file_identity)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `)
       const updateAsset = this.db.prepare(`
-        UPDATE assets SET absolute_path = ?, name = ?, size = ?, modified_at = ? WHERE path_key = ? RETURNING id
+        UPDATE assets SET absolute_path = ?, path_key = ?, name = ?, extension = ?, kind = ?,
+          size = ?, modified_at = ?, file_identity = ?, confirmed_missing = 0
+        WHERE id = ? AND (absolute_path <> ? OR size <> ? OR modified_at <> ? OR file_identity <> ? OR confirmed_missing = 1)
       `)
       const insertSearch = this.db.prepare(`
         INSERT INTO asset_search (rowid, name, folder_path, category, tags) VALUES (?, ?, ?, ?, '')
       `)
+      const renameSearch = this.db.prepare('UPDATE asset_search SET name = ?, folder_path = ? WHERE rowid = ?')
+      const clearLocations = this.db.prepare('DELETE FROM locations WHERE asset_id = ?')
       const upsertLocation = this.db.prepare(`
         INSERT INTO locations (asset_id, root_id, folder_id) VALUES (?, ?, ?)
         ON CONFLICT (asset_id, root_id) DO UPDATE SET folder_id = excluded.folder_id, available = 1
+        WHERE locations.folder_id <> excluded.folder_id OR locations.available = 0
       `)
-      const found = new Set<number>()
-      for (const file of snapshot.files) {
-        const key = pathKey(file.absolutePath)
-        const inserted = insertAsset.get(
-          file.absolutePath, key, file.name, file.extension, file.kind, file.category, file.size, when, file.modifiedAt,
-        )
-        const row = inserted ?? updateAsset.get(file.absolutePath, file.name, file.size, file.modifiedAt, key)!
-        const id = Number(row.id)
-        if (inserted) {
-          const folderPath = searchText(dirname(file.absolutePath))
-          // Both slash conventions work when searching for pasted folder paths.
-          const searchablePath = folderPath.includes('\\') ? folderPath + '\n' + folderPath.replaceAll('\\', '/') : folderPath
-          insertSearch.run(id, searchText(file.name), searchablePath, searchText(file.category))
+      for (const { root, snapshot } of scans) {
+        for (const folder of snapshot.folders) ensureFolder(root, folder.relativePath, folder.name)
+        for (const file of snapshot.files) {
+          const key = pathKey(file.absolutePath)
+          const existing = findAsset.get(key)
+          const candidates = !existing && identityPaths.get(file.identity) === key ? findMove.all(file.identity) : []
+          const candidate = candidates.length === 1 ? candidates[0] : undefined
+          const moved = candidate && !observed.has(String(candidate.path_key)) ? candidate : undefined
+          const path = searchText(dirname(file.absolutePath))
+          const searchablePath = path.includes('\\') ? path + '\n' + path.replaceAll('\\', '/') : path
+          let id: number
+          if (existing || moved) {
+            id = Number((existing ?? moved)!.id)
+            const updated = updateAsset.run(
+              file.absolutePath, key, file.name, file.extension, file.kind, file.size, file.modifiedAt, file.identity,
+              id, file.absolutePath, file.size, file.modifiedAt, file.identity,
+            )
+            if (updated.changes) {
+              changed = true
+              if (moved || existing?.absolute_path !== file.absolutePath || existing?.name !== file.name) {
+                renameSearch.run(searchText(file.name), searchablePath, id)
+              }
+            }
+          } else {
+            id = Number(insertAsset.run(
+              file.absolutePath, key, file.name, file.extension, file.kind, file.category, file.size, when,
+              file.modifiedAt, file.identity,
+            ).lastInsertRowid)
+            insertSearch.run(id, searchText(file.name), searchablePath, searchText(file.category))
+            changed = true
+          }
+          if (moved) {
+            clearLocations.run(id)
+            for (const linked of roots) {
+              if (!containsPath(linked.path, file.absolutePath)) continue
+              const folder = relative(linked.path, dirname(file.absolutePath)).split(sep).join('/')
+              upsertLocation.run(id, linked.id, ensureFolder(linked, folder))
+            }
+          } else {
+            changed = Boolean(upsertLocation.run(id, root.id, ensureFolder(root, file.relativeFolder)).changes) || changed
+          }
         }
-        upsertLocation.run(id, rootId, folderIds.get(relativeKey(file.relativeFolder))!)
-        found.add(id)
+        if (full) this.db.prepare('UPDATE roots SET scanned_at = ? WHERE id = ?').run(when, root.id)
       }
-
-      const skipped = new Set(snapshot.skipped.map(relativeKey))
-      function wasSkipped(relativePath: string): boolean {
-        let path = relativeKey(relativePath)
-        while (path) {
-          if (skipped.has(path)) return true
-          path = path.slice(0, Math.max(0, path.lastIndexOf('/')))
-        }
-        return false
-      }
-      const hideFolder = this.db.prepare('UPDATE folders SET present = 0 WHERE id = ?')
-      for (const folder of this.db.prepare('SELECT id, path_key FROM folders WHERE root_id = ? AND present = 1').all(rootId)) {
-        const key = String(folder.path_key)
-        if (!folderIds.has(key) && !wasSkipped(key)) hideFolder.run(folder.id!)
-      }
-      // Every location of this asset refers to the same absolute path.
-      const markMissing = this.db.prepare('UPDATE locations SET available = 0 WHERE asset_id = ?')
-      const existing = this.db.prepare(`
-        SELECT a.id, a.name, f.relative_path FROM locations l
-        JOIN assets a ON a.id = l.asset_id JOIN folders f ON f.id = l.folder_id
-        WHERE l.root_id = ? AND EXISTS (
-          SELECT 1 FROM locations current WHERE current.asset_id = l.asset_id AND current.available = 1
-        )
-      `).all(rootId)
-      for (const row of existing) {
-        const filePath = row.relative_path ? row.relative_path + '/' + row.name : String(row.name)
-        if (!found.has(Number(row.id)) && !wasSkipped(filePath)) markMissing.run(row.id!)
-      }
-      return { rootId, rootName, indexed: found.size, skipped: skipped.size }
     })
+    if (changed || foldersChanged) this.revision++
+    if (foldersChanged) this.folderRevision++
   }
 
   private transaction<T>(operation: () => T): T {

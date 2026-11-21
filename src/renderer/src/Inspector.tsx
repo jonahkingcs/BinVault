@@ -148,7 +148,7 @@ export function Inspector({ asset, checkerboard, onSave, onAction }: {
     if (tag.trim() && await save({ addTag: tag })) setTag('')
   }
 
-  const version = asset.modifiedAt + ':' + asset.size + ':' + asset.available
+  const version = asset.modifiedAt + ':' + asset.size + ':' + asset.extension + ':' + asset.available
   const details = media?.version === version ? media.details : {}
   const dimensions = dimensionsText(details)
   const duration = durationText(details.duration)
